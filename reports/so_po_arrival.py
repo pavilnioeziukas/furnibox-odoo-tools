@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from openpyxl.styles import Font, PatternFill
 
 from core.report_base import BaseReport
 
@@ -9,7 +10,7 @@ from core.report_base import BaseReport
 class SoPoArrivalReport(BaseReport):
     name = "SO → PO gavimo datų ataskaita"
     description = (
-        "Aktyvūs pardavimo užsakymai, susiję pirkimo užsakymai "
+        "Aktyvūs pardavimo užsakymai, susiję aktyvūs pirkimo užsakymai "
         "ir jų planuojamos bei faktinės gavimo datos."
     )
 
@@ -90,8 +91,9 @@ class SoPoArrivalReport(BaseReport):
 
         dataframe = dataframe.sort_values(
             by=[
-                "Status Priority",
-                "Commitment Date",
+                "Risk Priority",
+                "Days Until Commitment",
+                "PO Expected Arrival",
                 "SO",
                 "PO",
                 "Receipt",
@@ -102,12 +104,13 @@ class SoPoArrivalReport(BaseReport):
                 True,
                 True,
                 True,
+                True,
             ],
             na_position="last",
         ).reset_index(drop=True)
 
         dataframe = dataframe.drop(
-            columns=["Status Priority"]
+            columns=["Risk Priority"]
         )
 
         return dataframe
@@ -122,6 +125,7 @@ class SoPoArrivalReport(BaseReport):
             "id",
             "name",
             "partner_id",
+            "date_order",
             "commitment_date",
             "invoice_status",
         ]
@@ -139,6 +143,7 @@ class SoPoArrivalReport(BaseReport):
     ) -> list[dict[str, Any]]:
         domain = [
             ("sale_primary_id", "=", sale_order_id),
+            ("state", "!=", "cancel"),
         ]
 
         fields = [
@@ -181,6 +186,7 @@ class SoPoArrivalReport(BaseReport):
             receipt
             for receipt in receipts
             if receipt.get("picking_type_code") == "incoming"
+            and receipt.get("state") != "cancel"
         ]
 
     def build_row(
@@ -189,8 +195,23 @@ class SoPoArrivalReport(BaseReport):
         purchase_order: dict[str, Any] | None,
         receipt: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        today = pd.Timestamp.now().normalize()
+
+        so_date = self.to_datetime(
+            sale_order.get("date_order")
+        )
         commitment_date = self.to_datetime(
             sale_order.get("commitment_date")
+        )
+
+        so_age_days = self.calculate_date_difference(
+            later_date=today,
+            earlier_date=so_date,
+        )
+
+        days_until_commitment = self.calculate_date_difference(
+            later_date=commitment_date,
+            earlier_date=today,
         )
 
         base_row = {
@@ -198,7 +219,10 @@ class SoPoArrivalReport(BaseReport):
             "Customer": self.get_many2one_name(
                 sale_order.get("partner_id")
             ),
+            "SO Date": so_date,
+            "SO Age (days)": so_age_days,
             "Commitment Date": commitment_date,
+            "Days Until Commitment": days_until_commitment,
             "Invoice Status": sale_order.get(
                 "invoice_status",
                 "",
@@ -210,15 +234,15 @@ class SoPoArrivalReport(BaseReport):
                 **base_row,
                 "PO": "",
                 "Vendor": "",
-                "PO State": "No Purchase Order",
+                "PO State": "No Active Purchase Order",
                 "PO Expected Arrival": pd.NaT,
                 "Receipt": "",
                 "Receipt State": "",
                 "Scheduled Arrival": pd.NaT,
                 "Actual Arrival": pd.NaT,
-                "Days Late": pd.NA,
-                "Status": "No Purchase Order",
-                "Status Priority": 1,
+                "Supplier Delay (days)": pd.NA,
+                "Risk Status": "Missing PO",
+                "Risk Priority": 1,
             }
 
         expected_arrival = self.to_datetime(
@@ -236,11 +260,16 @@ class SoPoArrivalReport(BaseReport):
         }
 
         if receipt is None:
-            days_late, status, priority = self.calculate_status(
+            delay_days = self.calculate_open_delay(
                 expected_arrival=expected_arrival,
-                actual_arrival=pd.NaT,
+                today=today,
+            )
+
+            risk_status, risk_priority = self.calculate_risk_status(
+                days_until_commitment=days_until_commitment,
+                supplier_delay_days=delay_days,
                 receipt_state="",
-                has_receipt=False,
+                has_purchase_order=True,
             )
 
             return {
@@ -249,24 +278,30 @@ class SoPoArrivalReport(BaseReport):
                 "Receipt State": "No Incoming Receipt",
                 "Scheduled Arrival": pd.NaT,
                 "Actual Arrival": pd.NaT,
-                "Days Late": days_late,
-                "Status": status,
-                "Status Priority": priority,
+                "Supplier Delay (days)": delay_days,
+                "Risk Status": risk_status,
+                "Risk Priority": risk_priority,
             }
-
-        actual_arrival = self.to_datetime(
-            receipt.get("date_done")
-        )
 
         receipt_state = str(
             receipt.get("state", "")
         )
+        actual_arrival = self.to_datetime(
+            receipt.get("date_done")
+        )
 
-        days_late, status, priority = self.calculate_status(
+        supplier_delay_days = self.calculate_supplier_delay(
             expected_arrival=expected_arrival,
             actual_arrival=actual_arrival,
             receipt_state=receipt_state,
-            has_receipt=True,
+            today=today,
+        )
+
+        risk_status, risk_priority = self.calculate_risk_status(
+            days_until_commitment=days_until_commitment,
+            supplier_delay_days=supplier_delay_days,
+            receipt_state=receipt_state,
+            has_purchase_order=True,
         )
 
         return {
@@ -277,58 +312,107 @@ class SoPoArrivalReport(BaseReport):
                 receipt.get("scheduled_date")
             ),
             "Actual Arrival": actual_arrival,
-            "Days Late": days_late,
-            "Status": status,
-            "Status Priority": priority,
+            "Supplier Delay (days)": supplier_delay_days,
+            "Risk Status": risk_status,
+            "Risk Priority": risk_priority,
         }
 
     @staticmethod
-    def calculate_status(
+    def calculate_date_difference(
+        later_date: Any,
+        earlier_date: Any,
+    ) -> Any:
+        if pd.isna(later_date) or pd.isna(earlier_date):
+            return pd.NA
+
+        later_day = pd.Timestamp(later_date).normalize()
+        earlier_day = pd.Timestamp(earlier_date).normalize()
+
+        return int(
+            (later_day - earlier_day).days
+        )
+
+    @staticmethod
+    def calculate_open_delay(
         expected_arrival: Any,
-        actual_arrival: Any,
-        receipt_state: str,
-        has_receipt: bool,
-    ) -> tuple[Any, str, int]:
-        today = pd.Timestamp.now().normalize()
-
+        today: pd.Timestamp,
+    ) -> Any:
         if pd.isna(expected_arrival):
-            if not has_receipt:
-                return pd.NA, "No Expected Arrival", 2
+            return pd.NA
 
-            if receipt_state == "done":
-                return pd.NA, "Received - No Expected Date", 6
+        expected_day = pd.Timestamp(
+            expected_arrival
+        ).normalize()
 
-            return pd.NA, "Open - No Expected Date", 3
-
-        expected_day = expected_arrival.normalize()
-
-        if receipt_state == "done" and not pd.isna(actual_arrival):
-            actual_day = actual_arrival.normalize()
-            days_late = max(
-                int((actual_day - expected_day).days),
-                0,
-            )
-
-            if days_late > 0:
-                return days_late, "Received Late", 4
-
-            return 0, "Received On Time", 7
-
-        days_late = max(
+        return max(
             int((today - expected_day).days),
             0,
         )
 
-        if not has_receipt:
-            if days_late > 0:
-                return days_late, "Overdue - No Receipt", 1
+    @staticmethod
+    def calculate_supplier_delay(
+        expected_arrival: Any,
+        actual_arrival: Any,
+        receipt_state: str,
+        today: pd.Timestamp,
+    ) -> Any:
+        if pd.isna(expected_arrival):
+            return pd.NA
 
-            return 0, "Expected - No Receipt", 5
+        expected_day = pd.Timestamp(
+            expected_arrival
+        ).normalize()
 
-        if days_late > 0:
-            return days_late, "Overdue", 2
+        if (
+            receipt_state == "done"
+            and not pd.isna(actual_arrival)
+        ):
+            actual_day = pd.Timestamp(
+                actual_arrival
+            ).normalize()
 
-        return 0, "Expected", 6
+            return max(
+                int((actual_day - expected_day).days),
+                0,
+            )
+
+        return max(
+            int((today - expected_day).days),
+            0,
+        )
+
+    @staticmethod
+    def calculate_risk_status(
+        days_until_commitment: Any,
+        supplier_delay_days: Any,
+        receipt_state: str,
+        has_purchase_order: bool,
+    ) -> tuple[str, int]:
+        if not has_purchase_order:
+            return "Missing PO", 1
+
+        if receipt_state == "done":
+            if (
+                not pd.isna(supplier_delay_days)
+                and int(supplier_delay_days) > 0
+            ):
+                return "Received Late", 5
+
+            return "Received", 6
+
+        if (
+            not pd.isna(days_until_commitment)
+            and int(days_until_commitment) < 0
+        ):
+            return "Customer Late", 2
+
+        if (
+            not pd.isna(supplier_delay_days)
+            and int(supplier_delay_days) > 0
+        ):
+            return "Supplier Late", 3
+
+        return "Waiting", 4
 
     @staticmethod
     def get_many2one_name(value: Any) -> str:
@@ -355,15 +439,12 @@ class SoPoArrivalReport(BaseReport):
         dataframe: pd.DataFrame,
         row_limit: int = 30,
     ) -> None:
-        total_rows = len(dataframe)
+        print(f"\nAtaskaitos eilučių: {len(dataframe)}")
+        print("\nRizikų suvestinė:")
 
-        print(f"\nAtaskaitos eilučių: {total_rows}")
-        print("\nStatusų suvestinė:")
-
-        status_counts = (
-            dataframe["Status"]
-            .value_counts(dropna=False)
-        )
+        status_counts = dataframe[
+            "Risk Status"
+        ].value_counts(dropna=False)
 
         for status, count in status_counts.items():
             print(f"- {status}: {count}")
@@ -376,7 +457,7 @@ class SoPoArrivalReport(BaseReport):
             "display.max_columns",
             None,
             "display.width",
-            280,
+            320,
         ):
             print(
                 dataframe.head(row_limit).to_string(
@@ -419,82 +500,83 @@ class SoPoArrivalReport(BaseReport):
                 "A": 22,
                 "B": 35,
                 "C": 22,
-                "D": 18,
-                "E": 16,
-                "F": 30,
-                "G": 20,
-                "H": 22,
-                "I": 22,
-                "J": 22,
+                "D": 16,
+                "E": 22,
+                "F": 23,
+                "G": 18,
+                "H": 16,
+                "I": 30,
+                "J": 24,
                 "K": 22,
                 "L": 22,
-                "M": 15,
-                "N": 28,
+                "M": 22,
+                "N": 22,
+                "O": 22,
+                "P": 24,
             }
 
             for column, width in column_widths.items():
                 worksheet.column_dimensions[column].width = width
 
             for cell in worksheet[1]:
-                cell.font = cell.font.copy(
-                    bold=True
-                )
+                cell.font = Font(bold=True)
 
             status_column = None
 
             for cell in worksheet[1]:
-                if cell.value == "Status":
+                if cell.value == "Risk Status":
                     status_column = cell.column
                     break
 
+            fills = {
+                "Missing PO": PatternFill(
+                    fill_type="solid",
+                    fgColor="F4CCCC",
+                ),
+                "Customer Late": PatternFill(
+                    fill_type="solid",
+                    fgColor="EA9999",
+                ),
+                "Supplier Late": PatternFill(
+                    fill_type="solid",
+                    fgColor="F9CB9C",
+                ),
+                "Waiting": PatternFill(
+                    fill_type="solid",
+                    fgColor="FFF2CC",
+                ),
+                "Received Late": PatternFill(
+                    fill_type="solid",
+                    fgColor="FCE5CD",
+                ),
+                "Received": PatternFill(
+                    fill_type="solid",
+                    fgColor="D9EAD3",
+                ),
+            }
+
             if status_column is not None:
-                from openpyxl.styles import PatternFill
-
-                fills = {
-                    "No Purchase Order": PatternFill(
-                        fill_type="solid",
-                        fgColor="F4CCCC",
-                    ),
-                    "Overdue - No Receipt": PatternFill(
-                        fill_type="solid",
-                        fgColor="F4CCCC",
-                    ),
-                    "Overdue": PatternFill(
-                        fill_type="solid",
-                        fgColor="FCE5CD",
-                    ),
-                    "Received Late": PatternFill(
-                        fill_type="solid",
-                        fgColor="FCE5CD",
-                    ),
-                    "Expected": PatternFill(
-                        fill_type="solid",
-                        fgColor="FFF2CC",
-                    ),
-                    "Expected - No Receipt": PatternFill(
-                        fill_type="solid",
-                        fgColor="FFF2CC",
-                    ),
-                    "Received On Time": PatternFill(
-                        fill_type="solid",
-                        fgColor="D9EAD3",
-                    ),
-                }
-
                 for row_number in range(
                     2,
                     worksheet.max_row + 1,
                 ):
-                    status_cell = worksheet.cell(
+                    status_value = worksheet.cell(
                         row=row_number,
                         column=status_column,
-                    )
+                    ).value
 
-                    fill = fills.get(
-                        status_cell.value
-                    )
+                    row_fill = fills.get(status_value)
 
-                    if fill:
-                        status_cell.fill = fill
+                    if row_fill is None:
+                        continue
+
+                    for column_number in range(
+                        1,
+                        worksheet.max_column + 1,
+                    ):
+                        worksheet.cell(
+                            row=row_number,
+                            column=column_number,
+                        ).fill = row_fill
 
         return output_path.resolve()
