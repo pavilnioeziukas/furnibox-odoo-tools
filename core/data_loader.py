@@ -14,11 +14,15 @@ class DataLoader:
         self._sale_orders: list[dict[str, Any]] | None = None
         self._purchase_orders: list[dict[str, Any]] | None = None
         self._receipts: list[dict[str, Any]] | None = None
+        self._manufacturing_orders: list[dict[str, Any]] | None = None
+        self._work_orders: list[dict[str, Any]] | None = None
 
     def clear_cache(self) -> None:
         self._sale_orders = None
         self._purchase_orders = None
         self._receipts = None
+        self._manufacturing_orders = None
+        self._work_orders = None
 
     def load_active_sale_orders(
         self,
@@ -114,6 +118,93 @@ class DataLoader:
             and record.get("state") != "cancel"
         ]
         return self._receipts
+
+    def load_active_manufacturing_orders(
+        self,
+        sale_order_ids: Iterable[int],
+        *,
+        force_reload: bool = False,
+    ) -> list[dict[str, Any]]:
+        if self._manufacturing_orders is not None and not force_reload:
+            return self._manufacturing_orders
+
+        ids = sorted({int(item) for item in sale_order_ids if item})
+        if not ids:
+            self._manufacturing_orders = []
+            return self._manufacturing_orders
+
+        self._manufacturing_orders = self.client.search_read(
+            model="mrp.production",
+            domain=[
+                ("sale_primary_id", "in", ids),
+                ("state", "not in", ["done", "cancel"]),
+            ],
+            fields=[
+                "id",
+                "name",
+                "sale_primary_id",
+                "product_id",
+                "state",
+                "workorder_ids",
+            ],
+            order="sale_primary_id, name",
+        )
+        return self._manufacturing_orders
+
+    def load_work_orders(
+        self,
+        work_order_ids: Iterable[int],
+        *,
+        force_reload: bool = False,
+    ) -> list[dict[str, Any]]:
+        if self._work_orders is not None and not force_reload:
+            return self._work_orders
+
+        ids = sorted({int(item) for item in work_order_ids if item})
+        if not ids:
+            self._work_orders = []
+            return self._work_orders
+
+        self._work_orders = self.client.read(
+            model="mrp.workorder",
+            record_ids=ids,
+            fields=[
+                "id",
+                "name",
+                "production_id",
+                "workcenter_id",
+                "duration_expected",
+                "duration",
+                "state",
+            ],
+        )
+        return self._work_orders
+
+    def load_active_so_manufacturing_data(
+        self,
+        *,
+        force_reload: bool = False,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        if force_reload:
+            self.clear_cache()
+
+        sale_orders = self.load_active_sale_orders()
+        manufacturing_orders = self.load_active_manufacturing_orders(
+            sale_order["id"] for sale_order in sale_orders
+        )
+
+        work_order_ids = [
+            work_order_id
+            for manufacturing_order in manufacturing_orders
+            for work_order_id in manufacturing_order.get("workorder_ids", [])
+        ]
+        work_orders = self.load_work_orders(work_order_ids)
+
+        return sale_orders, manufacturing_orders, work_orders
 
     def load_so_po_receipt_data(
         self,
