@@ -2,15 +2,32 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.bom_engine import BomEngine
+from typing import Protocol
 from core.furnix_part_classifier import FurnixPartClassifier
 from core.odoo_client import OdooClient
 from core.odoo_helpers import many2one_id, many2one_name
 from core.sticker_info_validator import validate_sticker_info
 
 
+
+
+class SalesOrderExplosionProvider(Protocol):
+    def explode_sales_order(
+        self,
+        so_number: str,
+        *,
+        only_grouped_lines: bool = True,
+    ) -> Any:
+        ...
+
+
 QTY_TOLERANCE = 0.000001
 FURNIX_VENDOR_NAME = "FURNIX, UAB"
+
+
+def normalize_sku_key(value: Any) -> str:
+    """Canonical key for SKU comparison while preserving display values."""
+    return str(value or "").strip().upper()
 
 
 @dataclass
@@ -36,6 +53,13 @@ class FurnixPoValidationResult:
     furnix_po_count: int = 0
     status: str = ""
     error: str = ""
+
+    dataset_id: str = ""
+    batch_reference: str = ""
+    fallback_count: int = 0
+    fallbacks: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
     rows: list[FurnixPoComparisonRow] = field(default_factory=list)
 
     @property
@@ -78,10 +102,10 @@ class FurnixPoValidator:
     def __init__(
         self,
         client: OdooClient,
-        bom_engine: BomEngine,
+        execution_engine: SalesOrderExplosionProvider,
     ) -> None:
         self.client = client
-        self.bom_engine = bom_engine
+        self.execution_engine = execution_engine
 
     def validate(
         self,
@@ -158,7 +182,7 @@ class FurnixPoValidator:
         if len(furnix_purchase_orders) > 1:
             result.status = "MULTIPLE PO"
             result.error = (
-                "Vienam SO rasti keli aktyvūs Furnix PO: "
+                "Vienam SO rasti keli aktyvÅ«s Furnix PO: "
                 + ", ".join(
                     str(
                         po.get("name")
@@ -181,10 +205,71 @@ class FurnixPoValidator:
             purchase_order.get("partner_id")
         )
 
-        bom_result = self.bom_engine.explode_sales_order(
+        bom_result = self.execution_engine.explode_sales_order(
             so_number,
             only_grouped_lines=True,
         )
+
+        result.dataset_id = str(
+            getattr(bom_result, "dataset_id", "") or ""
+        )
+        result.batch_reference = str(
+            getattr(bom_result, "batch_reference", "") or ""
+        )
+
+        raw_fallbacks = list(
+            getattr(bom_result, "fallbacks", []) or []
+        )
+        result.fallback_count = len(raw_fallbacks)
+
+        for fallback in raw_fallbacks:
+            result.fallbacks.append(
+                {
+                    "sale_line_id": getattr(
+                        fallback,
+                        "sale_line_id",
+                        None,
+                    ),
+                    "group_name": str(
+                        getattr(
+                            fallback,
+                            "group_name",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "root_sku": str(
+                        getattr(
+                            fallback,
+                            "root_sku",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "reason": str(
+                        getattr(
+                            fallback,
+                            "reason",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "source": str(
+                        getattr(
+                            fallback,
+                            "source",
+                            "ODOO_FALLBACK",
+                        )
+                        or "ODOO_FALLBACK"
+                    ),
+                }
+            )
+
+        if result.fallback_count:
+            result.warnings.append(
+                "Naudotas Odoo BOM fallback "
+                f"{result.fallback_count} SO eilutėms."
+            )
 
         if bom_result.has_errors:
             result.status = "BOM ERROR"
@@ -208,12 +293,24 @@ class FurnixPoValidator:
             list[dict[str, Any]],
         ] = defaultdict(list)
         product_name_by_sku: dict[str, str] = {}
+        display_sku_by_key: dict[str, str] = {}
 
         for row in furnix_leaf_rows:
-            sku = row.component_sku
+            display_sku = str(
+                row.component_sku or ""
+            ).strip()
+            sku = normalize_sku_key(display_sku)
+
+            if not sku:
+                continue
 
             required_by_sku[sku] += (
                 row.required_qty
+            )
+
+            display_sku_by_key.setdefault(
+                sku,
+                display_sku,
             )
 
             product_name_by_sku[sku] = (
@@ -290,12 +387,20 @@ class FurnixPoValidator:
                 {},
             )
 
-            sku = str(
+            display_sku = str(
                 product.get("default_code") or ""
+            ).strip()
+            sku = normalize_sku_key(
+                display_sku
             )
 
             if not sku:
                 continue
+
+            display_sku_by_key.setdefault(
+                sku,
+                display_sku,
+            )
 
             po_qty_by_sku[sku] += float(
                 line.get("product_qty") or 0
@@ -370,7 +475,12 @@ class FurnixPoValidator:
 
             result.rows.append(
                 FurnixPoComparisonRow(
-                    sku=sku,
+                    sku=(
+                        display_sku_by_key.get(
+                            sku,
+                            sku,
+                        )
+                    ),
                     product_name=(
                         product_name_by_sku.get(
                             sku,
@@ -409,6 +519,8 @@ class FurnixPoValidator:
             result.status = "QTY MISMATCH"
         elif "STICKER INFO ERROR" in sticker_statuses:
             result.status = "STICKER INFO ERROR"
+        elif result.fallback_count:
+            result.status = "PASS WITH FALLBACK"
         else:
             result.status = "PASS"
 

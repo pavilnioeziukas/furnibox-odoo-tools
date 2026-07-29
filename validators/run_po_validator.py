@@ -2,6 +2,7 @@ from core.bom_engine import BomEngine
 from core.bom_repository import BomRepository
 from core.bom_selector import BomSelector
 from core.config import OdooConfig
+from core.dataset_execution_engine import DatasetExecutionEngine
 from core.odoo_client import (
     OdooClient,
     OdooConnectionError,
@@ -28,14 +29,20 @@ def main() -> None:
         selector = BomSelector(
             repository
         )
-        engine = BomEngine(
+        odoo_engine = BomEngine(
             repository,
             selector,
         )
 
+        execution_engine = DatasetExecutionEngine(
+            client,
+            odoo_engine,
+            environment="production",
+        )
+
         validator = FurnixPoValidator(
             client,
-            engine,
+            execution_engine,
         )
 
         result = validator.validate(
@@ -71,12 +78,41 @@ def main() -> None:
             f"Bendras statusas: "
             f"{result.status}"
         )
+        print(
+            f"Dataset ID:       "
+            f"{result.dataset_id or '-'}"
+        )
+        print(
+            f"Dataset batch:    "
+            f"{result.batch_reference or '-'}"
+        )
+        print(
+            f"Odoo fallback:    "
+            f"{result.fallback_count}"
+        )
 
         if result.error:
             print(
                 f"Klaida:           "
                 f"{result.error}"
             )
+
+        if result.warnings:
+            print()
+            print("PERSPĖJIMAI:")
+            for warning in result.warnings:
+                print(f"- {warning}")
+
+        if result.fallbacks:
+            print()
+            print("ODOO BOM FALLBACK:")
+            for fallback in result.fallbacks:
+                print(
+                    "- "
+                    f"{fallback.get('root_sku') or '-'}"
+                    f" | grupė: {fallback.get('group_name') or '-'}"
+                    f" | {fallback.get('reason') or ''}"
+                )
 
         print()
         print(
@@ -135,10 +171,19 @@ def main() -> None:
         print()
         print("=" * 100)
 
-        if result.status == "PASS":
+        if result.status in {
+            "PASS",
+            "PASS WITH FALLBACK",
+        }:
             print(
                 "PO GALIMA TVIRTINTI IR SIŲSTI TIEKĖJUI."
             )
+
+            if result.status == "PASS WITH FALLBACK":
+                print(
+                    "PASTABA: DALIAI SO EILUČIŲ NAUDOTAS "
+                    "AKTYVUS ODOO BOM FALLBACK."
+                )
         else:
             print(
                 "PO TVIRTINTI NEGALIMA. "
