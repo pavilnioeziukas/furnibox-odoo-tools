@@ -70,7 +70,7 @@ class BomEngine:
                     group_name="",
                     root_sku="",
                     error=(
-                        "Rasti keli SO tuo pačiu numeriu: "
+                        "Rasti keli SO tuo paÄ¨iu numeriu: "
                         f"{so_number}"
                     ),
                 )
@@ -92,7 +92,7 @@ class BomEngine:
                     sale_line_id=None,
                     group_name="",
                     root_sku="",
-                    error=f"SO neturi eilučių: {so_number}",
+                    error=f"SO neturi eiluÄ¨iÅ³: {so_number}",
                 )
             )
             return result
@@ -161,7 +161,7 @@ class BomEngine:
                     sale_line_id=sale_line_id,
                     group_name=group_name,
                     root_sku="",
-                    error="SO eilutė neturi produkto",
+                    error="SO eilutÄ— neturi produkto",
                 )
             )
             return
@@ -182,7 +182,7 @@ class BomEngine:
 
             if root_qty <= 0:
                 raise RuntimeError(
-                    f"SO eilutės kiekis netinkamas: {root_qty}"
+                    f"SO eilutÄ—s kiekis netinkamas: {root_qty}"
                 )
 
             selected_bom = (
@@ -239,6 +239,77 @@ class BomEngine:
                 )
             )
 
+    def _resolve_bom_parent_sku(
+        self,
+        bom: dict[str, Any],
+    ) -> str:
+        """Grąžina tikrą BOM tėvinio produkto SKU.
+
+        Odoo BOM dažnai turi tik product_tmpl_id, todėl many2one
+        pavadinimas nėra tinkamas stabilus palyginimo raktas.
+        """
+        parent_product_id = many2one_id(
+            bom.get("product_id")
+        )
+
+        if parent_product_id is not None:
+            parent_product = self.repository.get_product(
+                parent_product_id
+            )
+
+            return str(
+                parent_product.get("default_code")
+                or parent_product.get("display_name")
+                or parent_product_id
+            ).strip()
+
+        template_id = many2one_id(
+            bom.get("product_tmpl_id")
+        )
+
+        if template_id is None:
+            raise RuntimeError(
+                f"BOM ID {bom.get('id')} neturi produkto template."
+            )
+
+        variants = self.repository.client.search_read(
+            model="product.product",
+            domain=[
+                ["product_tmpl_id", "=", template_id],
+                ["default_code", "!=", False],
+            ],
+            fields=[
+                "default_code",
+                "active",
+            ],
+            limit=3,
+        )
+
+        active_variants = [
+            row
+            for row in variants
+            if row.get("active", True)
+            and str(row.get("default_code") or "").strip()
+        ]
+
+        candidates = active_variants or [
+            row
+            for row in variants
+            if str(row.get("default_code") or "").strip()
+        ]
+
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "Negalima vienareikšmiškai nustatyti BOM tėvinio SKU: "
+                f"BOM ID {bom.get('id')}, template ID {template_id}, "
+                f"variantų su SKU {len(candidates)}."
+            )
+
+        return str(
+            candidates[0].get("default_code")
+            or ""
+        ).strip()
+
     def _explode_bom(
         self,
         *,
@@ -270,7 +341,7 @@ class BomEngine:
 
         if not bom.get("active"):
             raise RuntimeError(
-                f"BOM ID {current_bom_id} nėra aktyvus"
+                f"BOM ID {current_bom_id} nÄ—ra aktyvus"
             )
 
         bom_base_qty = float(
@@ -280,7 +351,7 @@ class BomEngine:
         if bom_base_qty <= 0:
             raise RuntimeError(
                 f"BOM ID {current_bom_id} turi "
-                f"netinkamą product_qty={bom_base_qty}"
+                f"netinkamÄ… product_qty={bom_base_qty}"
             )
 
         bom_line_ids = [
@@ -294,7 +365,7 @@ class BomEngine:
         if not bom_line_ids:
             raise RuntimeError(
                 f"BOM ID {current_bom_id} "
-                "neturi BOM eilučių"
+                "neturi BOM eiluÄ¨iÅ³"
             )
 
         bom_lines_by_id = (
@@ -303,26 +374,9 @@ class BomEngine:
             )
         )
 
-        parent_product_id = many2one_id(
-            bom.get("product_id")
+        parent_sku = self._resolve_bom_parent_sku(
+            bom
         )
-
-        if parent_product_id is not None:
-            parent_product = (
-                self.repository.get_product(
-                    parent_product_id
-                )
-            )
-
-            parent_sku = str(
-                parent_product.get("default_code")
-                or parent_product.get("display_name")
-                or parent_product_id
-            )
-        else:
-            parent_sku = many2one_name(
-                bom.get("product_tmpl_id")
-            )
 
         bom_lines = sorted(
             bom_lines_by_id.values(),
@@ -339,7 +393,7 @@ class BomEngine:
 
             if component_id is None:
                 raise RuntimeError(
-                    f"BOM eilutė "
+                    f"BOM eilutÄ— "
                     f"{bom_line.get('id')} "
                     "neturi komponento"
                 )
@@ -364,9 +418,9 @@ class BomEngine:
 
             if bom_line_qty < 0:
                 raise RuntimeError(
-                    f"BOM eilutė "
+                    f"BOM eilutÄ— "
                     f"{bom_line.get('id')} turi "
-                    f"netinkamą kiekį "
+                    f"netinkamÄ… kiekÄÆ "
                     f"{bom_line_qty}"
                 )
 
