@@ -1,12 +1,12 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
-
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from core.furnix_part_classifier import FurnixPartClassifier
-from core.odoo_client import OdooClient
 from core.odoo_helpers import many2one_id, many2one_name
 from core.sticker_info_validator import validate_sticker_info
+
+if TYPE_CHECKING:
+    from core.odoo_client import OdooClient
 
 
 
@@ -101,7 +101,7 @@ class FurnixPoValidationResult:
 class FurnixPoValidator:
     def __init__(
         self,
-        client: OdooClient,
+        client: "OdooClient",
         execution_engine: SalesOrderExplosionProvider,
     ) -> None:
         self.client = client

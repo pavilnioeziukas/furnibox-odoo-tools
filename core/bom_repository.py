@@ -1,6 +1,7 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from core.odoo_client import OdooClient
+if TYPE_CHECKING:
+    from core.odoo_client import OdooClient
 
 
 class BomRepositoryError(RuntimeError):
@@ -37,7 +38,7 @@ class BomRepository:
         "child_bom_id",
     ]
 
-    def __init__(self, client: OdooClient) -> None:
+    def __init__(self, client: "OdooClient") -> None:
         self.client = client
 
         self._products: dict[int, dict[str, Any]] = {}

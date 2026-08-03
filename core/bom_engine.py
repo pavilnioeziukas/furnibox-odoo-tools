@@ -416,7 +416,7 @@ class BomEngine:
                 bom_line.get("product_qty") or 0
             )
 
-            if bom_line_qty < 0:
+            if bom_line_qty <= 0:
                 raise RuntimeError(
                     f"BOM eilutÄ— "
                     f"{bom_line.get('id')} turi "
