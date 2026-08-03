@@ -1,15 +1,22 @@
 import xmlrpc.client
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from core.config import OdooConfig
+if TYPE_CHECKING:
+    from core.config import OdooConfig
 
 
 class OdooConnectionError(Exception):
     """Klaida jungiantis prie Odoo."""
 
 
+class OdooReadOnlyError(Exception):
+    """Bandymas per tik skaitymui skirtą klientą keisti Odoo duomenis."""
+
+
 class OdooClient:
-    def __init__(self, config: OdooConfig) -> None:
+    ALLOWED_METHODS = frozenset({"fields_get", "read", "search", "search_read"})
+
+    def __init__(self, config: "OdooConfig") -> None:
         self.config = config
         self.uid: int | None = None
 
@@ -57,6 +64,11 @@ class OdooClient:
         args: list[Any] | None = None,
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        if method not in self.ALLOWED_METHODS:
+            raise OdooReadOnlyError(
+                f"Odoo metodas '{method}' neleidžiamas tik skaitymo režime."
+            )
+
         uid = self._ensure_connected()
 
         try:
@@ -140,38 +152,4 @@ class OdooClient:
             method="search_read",
             args=[domain],
             kwargs=kwargs,
-        )
-
-    def create(
-        self,
-        model: str,
-        values: dict[str, Any],
-    ) -> int:
-        return self.execute(
-            model=model,
-            method="create",
-            args=[values],
-        )
-
-    def write(
-        self,
-        model: str,
-        record_ids: list[int],
-        values: dict[str, Any],
-    ) -> bool:
-        return self.execute(
-            model=model,
-            method="write",
-            args=[record_ids, values],
-        )
-
-    def unlink(
-        self,
-        model: str,
-        record_ids: list[int],
-    ) -> bool:
-        return self.execute(
-            model=model,
-            method="unlink",
-            args=[record_ids],
         )
