@@ -18,8 +18,14 @@ class OdooConfig:
     def from_env(cls) -> "OdooConfig":
         config = cls(
             url=os.getenv("ODOO_URL", "").strip().rstrip("/"),
-            database=os.getenv("ODOO_DATABASE", "").strip(),
-            username=os.getenv("ODOO_USERNAME", "").strip(),
+            database=(
+                os.getenv("ODOO_DATABASE")
+                or os.getenv("ODOO_DB", "")
+            ).strip(),
+            username=(
+                os.getenv("ODOO_USERNAME")
+                or os.getenv("ODOO_LOGIN", "")
+            ).strip(),
             api_key=os.getenv("ODOO_API_KEY", "").strip(),
         )
 

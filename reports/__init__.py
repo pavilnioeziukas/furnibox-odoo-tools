@@ -4,6 +4,7 @@ from reports.furnix_po_validation_report import (
     FurnixPoValidationReport,
 )
 from reports.so_po_arrival import SoPoArrivalReport
+from reports.stock_by_location import StockByLocationReport
 from reports.work_center_diagnostics import (
     WorkCenterDiagnostics,
 )
@@ -18,3 +19,4 @@ def register_reports(
     registry.register(WorkCenterLoadReport)
     registry.register(CategoryLoadReport)
     registry.register(FurnixPoValidationReport)
+    registry.register(StockByLocationReport)
