@@ -190,31 +190,23 @@ def main() -> None:
                     f" | MO: {', '.join(row.mo_names) or '-'}"
                 )
 
-        print()
+               print()
         print("=" * 100)
 
-        if result.status in {
-            "PASS",
-            "PASS WITH FALLBACK",
-        }:
-            print(
-                "PO GALIMA TVIRTINTI IR SIŲSTI TIEKĖJUI."
-            )
-
-            if result.status == "PASS WITH FALLBACK":
-                print(
-                    "PASTABA: DALIAI SO EILUČIŲ NAUDOTAS "
-                    "AKTYVUS ODOO BOM FALLBACK."
-                )
-            if result.supply_issue_count:
-                print(
-                    "DĖMESIO: PO palyginimas praėjo, bet tiekimo grandinėje "
-                    "yra neužbaigtų veiksmų. Žr. SUPPLY STATUS eilutes."
-                )
+        if result.supply_issue_count == 0:
+            print("TIEKIMO / REZERVACIJŲ BŪSENA: nėra neužbaigtų veiksmų sutampantiems SKU.")
         else:
             print(
-                "PO TVIRTINTI NEGALIMA. "
-                "PIRMIAUSIA REIKIA IŠTAISYTI KLAIDAS."
+                "TIEKIMO / REZERVACIJŲ BŪSENA: yra neužbaigtų veiksmų. "
+                "Žr. SUPPLY STATUS eilutes."
+            )
+
+        if result.status == "PASS":
+            print("DUOMENŲ BŪSENA: BOM ir PO sutampa.")
+        else:
+            print(
+                "DUOMENŲ BŪSENA: nustatyti BOM–PO neatitikimai "
+                "(MISSING / EXTRA / QTY MISMATCH). Jie vertintini atskirai nuo rezervacijų."
             )
 
     except OdooConnectionError as exc:
