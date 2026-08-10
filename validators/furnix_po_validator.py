@@ -42,6 +42,17 @@ class FurnixPoComparisonRow:
     component_sticker_info: list[str] = field(default_factory=list)
     sticker_status: str = ""
     sticker_error: str = ""
+    received_qty: float = 0.0
+    input_custom_qty: float = 0.0
+    sorted_qty: float = 0.0
+    sorting_pending_qty: float = 0.0
+    mo_demand_qty: float = 0.0
+    mo_reserved_qty: float = 0.0
+    supply_status: str = ""
+    supply_error: str = ""
+    receipt_names: list[str] = field(default_factory=list)
+    sorting_names: list[str] = field(default_factory=list)
+    mo_names: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -97,6 +108,19 @@ class FurnixPoValidationResult:
             for row in self.rows
         )
 
+    @property
+    def supply_issue_count(self) -> int:
+        return sum(
+            row.supply_status in {
+                "NOT RECEIVED",
+                "SORTING NOT DONE",
+                "SORTING PARTIAL",
+                "MO NOT RESERVED",
+                "NO RECEIPT TRACE",
+            }
+            for row in self.rows
+        )
+
 
 class FurnixPoValidator:
     def __init__(
@@ -106,6 +130,141 @@ class FurnixPoValidator:
     ) -> None:
         self.client = client
         self.execution_engine = execution_engine
+
+    def _fields(self, model: str) -> set[str]:
+        """Return fields that actually exist in this Odoo database.
+
+        The deployment has custom fields, so this avoids making a report fail
+        just because a standard field was renamed or is unavailable.
+        """
+        return set(self.client.execute(model, "fields_get").keys())
+
+    @staticmethod
+    def _qty(record: dict[str, Any], *field_names: str) -> float:
+        for field_name in field_names:
+            if field_name in record:
+                return float(record.get(field_name) or 0.0)
+        return 0.0
+
+    def _supply_chain_by_sku(
+        self,
+        *,
+        sale_order_id: int,
+        purchase_order: dict[str, Any],
+    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        """Read PO fulfilment and MO reservation state, without changing Odoo.
+
+        Quantities are aggregated per product SKU.  This deliberately reports
+        both completed and pending sorting moves: a completed receipt alone is
+        not evidence that a component can be reserved by manufacturing.
+        """
+        warnings: list[str] = []
+        supply: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {
+                "received_qty": 0.0, "input_custom_qty": 0.0,
+                "sorted_qty": 0.0, "sorting_pending_qty": 0.0,
+                "mo_demand_qty": 0.0, "mo_reserved_qty": 0.0,
+                "receipt_names": [], "sorting_names": [], "mo_names": [],
+            }
+        )
+
+        picking_fields = self._fields("stock.picking")
+        move_fields = self._fields("stock.move")
+        production_fields = self._fields("mrp.production")
+
+        po_id = int(purchase_order["id"])
+        po_picking_ids = [int(value) for value in purchase_order.get("picking_ids", [])]
+        if not po_picking_ids and "purchase_id" in picking_fields:
+            po_pickings = self.client.search_read(
+                "stock.picking", [["purchase_id", "=", po_id]],
+                fields=["name", "state", "picking_type_id", "location_id", "location_dest_id"],
+            )
+            po_picking_ids = [int(picking["id"]) for picking in po_pickings]
+
+        base_picking_fields = [
+            field_name for field_name in ["name", "state", "picking_type_id", "location_id", "location_dest_id", "move_ids_without_package"]
+            if field_name in picking_fields
+        ]
+        receipt_pickings = self.client.read("stock.picking", po_picking_ids, base_picking_fields) if po_picking_ids else []
+        receipt_ids = {int(picking["id"]) for picking in receipt_pickings}
+        receipt_names = {int(picking["id"]): str(picking.get("name") or picking["id"]) for picking in receipt_pickings}
+
+        # Custom Primary Sale Order is the authoritative link.  If a database
+        # lacks it on pickings/moves, report that fact instead of guessing.
+        primary_field = "sale_primary_id"
+        sorting_pickings: list[dict[str, Any]] = []
+        if primary_field in picking_fields:
+            sorting_pickings = self.client.search_read(
+                "stock.picking", [[primary_field, "=", sale_order_id]],
+                fields=base_picking_fields,
+                order="id asc",
+            )
+        else:
+            warnings.append("stock.picking neturi lauko sale_primary_id; rūšiavimo perkėlimų pagal SO patikra negalima.")
+
+        all_pickings = {int(picking["id"]): picking for picking in receipt_pickings + sorting_pickings}
+        sorting_ids = set(all_pickings) - receipt_ids
+        move_query_fields = [
+            field_name for field_name in ["product_id", "picking_id", "state", "product_uom_qty", "quantity", "quantity_done", "location_id", "location_dest_id"]
+            if field_name in move_fields
+        ]
+        pickings_to_read = sorted(all_pickings)
+        moves = self.client.search_read(
+            "stock.move", [["picking_id", "in", pickings_to_read]], fields=move_query_fields,
+        ) if pickings_to_read else []
+
+        product_ids = sorted({many2one_id(move.get("product_id")) for move in moves if many2one_id(move.get("product_id")) is not None})
+        products = self.client.read("product.product", product_ids, ["default_code"]) if product_ids else []
+        sku_by_product = {int(product["id"]): normalize_sku_key(product.get("default_code")) for product in products}
+
+        for move in moves:
+            product_id = many2one_id(move.get("product_id"))
+            sku = sku_by_product.get(product_id or -1, "")
+            picking_id = many2one_id(move.get("picking_id"))
+            if not sku or picking_id is None:
+                continue
+            picking = all_pickings[picking_id]
+            move_qty = self._qty(move, "quantity_done", "quantity", "product_uom_qty")
+            picking_name = str(picking.get("name") or picking_id)
+            if picking_id in receipt_ids:
+                supply[sku]["receipt_names"].append(picking_name)
+                if move.get("state") == "done":
+                    supply[sku]["received_qty"] += move_qty
+                    destination = many2one_name(picking.get("location_dest_id")).upper()
+                    if "INPUT-CUSTOM" in destination or "INPUT CUSTOM" in destination:
+                        supply[sku]["input_custom_qty"] += move_qty
+            elif picking_id in sorting_ids:
+                supply[sku]["sorting_names"].append(picking_name)
+                if move.get("state") == "done":
+                    supply[sku]["sorted_qty"] += move_qty
+                elif move.get("state") not in {"cancel"}:
+                    supply[sku]["sorting_pending_qty"] += self._qty(move, "product_uom_qty", "quantity")
+
+        if primary_field not in production_fields:
+            warnings.append("mrp.production neturi lauko sale_primary_id; MO rezervacijos pagal SO patikra negalima.")
+            return supply, warnings
+
+        productions = self.client.search_read(
+            "mrp.production", [[primary_field, "=", sale_order_id], ["state", "!=", "cancel"]],
+            fields=["name", "move_raw_ids", "state"], order="id asc",
+        )
+        raw_move_ids = [int(move_id) for production in productions for move_id in production.get("move_raw_ids", [])]
+        raw_moves = self.client.read("stock.move", raw_move_ids, move_query_fields) if raw_move_ids else []
+        raw_product_ids = sorted({many2one_id(move.get("product_id")) for move in raw_moves if many2one_id(move.get("product_id")) is not None})
+        missing_product_ids = [product_id for product_id in raw_product_ids if product_id not in sku_by_product]
+        if missing_product_ids:
+            products = self.client.read("product.product", missing_product_ids, ["default_code"])
+            sku_by_product.update({int(product["id"]): normalize_sku_key(product.get("default_code")) for product in products})
+        production_by_raw_move = {int(move_id): str(production.get("name") or production["id"]) for production in productions for move_id in production.get("move_raw_ids", [])}
+        for move in raw_moves:
+            sku = sku_by_product.get(many2one_id(move.get("product_id")) or -1, "")
+            if not sku or move.get("state") == "cancel":
+                continue
+            supply[sku]["mo_demand_qty"] += self._qty(move, "product_uom_qty")
+            supply[sku]["mo_reserved_qty"] += self._qty(move, "quantity", "quantity_done")
+            supply[sku]["mo_names"].append(production_by_raw_move.get(int(move["id"]), "?"))
+
+        return supply, warnings
 
     def validate(
         self,
@@ -154,6 +313,7 @@ class FurnixPoValidator:
                 "partner_id",
                 "sale_primary_id",
                 "order_line",
+                "picking_ids",
             ],
             order="id asc",
         )
@@ -499,6 +659,46 @@ class FurnixPoValidator:
                     sticker_error=sticker_error,
                 )
             )
+
+        supply_by_sku, supply_warnings = self._supply_chain_by_sku(
+            sale_order_id=sale_order_id,
+            purchase_order=purchase_order,
+        )
+        result.warnings.extend(supply_warnings)
+
+        for row in result.rows:
+            supply = supply_by_sku.get(normalize_sku_key(row.sku), {})
+            row.received_qty = float(supply.get("received_qty", 0.0))
+            row.input_custom_qty = float(supply.get("input_custom_qty", 0.0))
+            row.sorted_qty = float(supply.get("sorted_qty", 0.0))
+            row.sorting_pending_qty = float(supply.get("sorting_pending_qty", 0.0))
+            row.mo_demand_qty = float(supply.get("mo_demand_qty", 0.0))
+            row.mo_reserved_qty = float(supply.get("mo_reserved_qty", 0.0))
+            row.receipt_names = sorted(set(supply.get("receipt_names", [])))
+            row.sorting_names = sorted(set(supply.get("sorting_names", [])))
+            row.mo_names = sorted(set(supply.get("mo_names", [])))
+
+            # PO comparison errors remain the primary status.  Supply status
+            # explains why a correctly ordered component is still unavailable.
+            if row.status != "PASS":
+                row.supply_status = "NOT CHECKED"
+            elif row.received_qty + QTY_TOLERANCE < row.po_qty:
+                row.supply_status = "NOT RECEIVED"
+                row.supply_error = "Furnix PO dar nepriimtas pilnai."
+            elif row.input_custom_qty > QTY_TOLERANCE and row.sorted_qty + QTY_TOLERANCE < row.received_qty:
+                row.supply_status = "SORTING NOT DONE"
+                row.supply_error = "Detalė priimta į WH/Input-Custom, bet rūšiavimas į WH/Stock nepatvirtintas."
+            elif row.sorting_pending_qty > QTY_TOLERANCE:
+                row.supply_status = "SORTING PARTIAL"
+                row.supply_error = "Dalis rūšiavimo perkėlimo dar nepatvirtinta."
+            elif row.mo_demand_qty > QTY_TOLERANCE and row.mo_reserved_qty + QTY_TOLERANCE < row.mo_demand_qty:
+                row.supply_status = "MO NOT RESERVED"
+                row.supply_error = "Detalė pasiekė sandėlį, bet MO komponentas nėra pilnai rezervuotas."
+            elif row.received_qty > QTY_TOLERANCE:
+                row.supply_status = "AVAILABLE / RESERVED"
+            else:
+                row.supply_status = "NO RECEIPT TRACE"
+                row.supply_error = "Nerastas priėmimo perkėlimas pagal šį PO."
 
         statuses = {
             row.status

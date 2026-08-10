@@ -12,7 +12,8 @@ from validators.furnix_po_validator import (
 )
 
 
-SO_NUMBER = "US262126469REG"
+# Paleidžiant kitam užsakymui keičiamas tik šis numeris.
+SO_NUMBER = "DE262627062REG"
 
 
 def main() -> None:
@@ -135,9 +136,13 @@ def main() -> None:
             f"STICKER ERROR:    "
             f"{result.sticker_error_count}"
         )
+        print(
+            f"SUPPLY ISSUES:    "
+            f"{result.supply_issue_count}"
+        )
 
         print()
-        print("=" * 150)
+        print("=" * 220)
 
         print(
             f"{'ROW STATUS':<16}"
@@ -145,10 +150,14 @@ def main() -> None:
             f"{'SKU':<48}"
             f"{'REQUIRED':<12}"
             f"{'PO QTY':<12}"
-            f"{'DIFF'}"
+            f"{'RECEIVED':<12}"
+            f"{'INPUT':<12}"
+            f"{'SORTED':<12}"
+            f"{'MO RES.':<12}"
+            f"{'SUPPLY STATUS'}"
         )
 
-        print("-" * 150)
+        print("-" * 220)
 
         for row in result.rows:
             print(
@@ -157,7 +166,11 @@ def main() -> None:
                 f"{row.sku[:46]:<48}"
                 f"{row.required_qty:<12}"
                 f"{row.po_qty:<12}"
-                f"{row.difference}"
+                f"{row.received_qty:<12}"
+                f"{row.input_custom_qty:<12}"
+                f"{row.sorted_qty:<12}"
+                f"{row.mo_reserved_qty:<12}"
+                f"{row.supply_status}"
             )
 
             if row.sticker_error:
@@ -166,6 +179,15 @@ def main() -> None:
                     f"{'':<22}"
                     f"Sticker klaida: "
                     f"{row.sticker_error}"
+                )
+
+            if row.supply_error:
+                print(f"{'':<40}Tiekimo priežastis: {row.supply_error}")
+            if row.receipt_names or row.sorting_names or row.mo_names:
+                print(
+                    f"{'':<40}Receipt: {', '.join(row.receipt_names) or '-'}"
+                    f" | Sorting: {', '.join(row.sorting_names) or '-'}"
+                    f" | MO: {', '.join(row.mo_names) or '-'}"
                 )
 
         print()
@@ -183,6 +205,11 @@ def main() -> None:
                 print(
                     "PASTABA: DALIAI SO EILUČIŲ NAUDOTAS "
                     "AKTYVUS ODOO BOM FALLBACK."
+                )
+            if result.supply_issue_count:
+                print(
+                    "DĖMESIO: PO palyginimas praėjo, bet tiekimo grandinėje "
+                    "yra neužbaigtų veiksmų. Žr. SUPPLY STATUS eilutes."
                 )
         else:
             print(
