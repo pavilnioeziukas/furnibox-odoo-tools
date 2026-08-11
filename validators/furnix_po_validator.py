@@ -1,4 +1,4 @@
-from collections import defaultdict
+﻿from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 from core.furnix_part_classifier import FurnixPartClassifier
@@ -48,6 +48,8 @@ class FurnixPoComparisonRow:
     sorting_pending_qty: float = 0.0
     mo_demand_qty: float = 0.0
     mo_reserved_qty: float = 0.0
+    cross_so_reserved_qty: float = 0.0
+    cross_so_reservations: list[dict[str, Any]] = field(default_factory=list)
     supply_status: str = ""
     supply_error: str = ""
     receipt_names: list[str] = field(default_factory=list)
@@ -145,6 +147,131 @@ class FurnixPoValidator:
             if field_name in record:
                 return float(record.get(field_name) or 0.0)
         return 0.0
+
+    def _cross_so_reservations_by_sku(
+        self,
+        *,
+        current_sale_order_id: int,
+        skus: set[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not skus:
+            return {}
+
+        product_domain: list[Any] = []
+
+        for sku in sorted(skus):
+            if product_domain:
+                product_domain.insert(0, "|")
+            product_domain.append(
+                ["default_code", "=ilike", sku]
+            )
+
+        products = self.client.search_read(
+            "product.product",
+            product_domain,
+            fields=["default_code"],
+        )
+
+        sku_by_product_id = {
+            int(product["id"]): normalize_sku_key(
+                product.get("default_code")
+            )
+            for product in products
+            if product.get("default_code")
+        }
+
+        if not sku_by_product_id:
+            return {}
+
+        moves = self.client.search_read(
+            "stock.move",
+            [
+                ["product_id", "in", sorted(sku_by_product_id)],
+                ["raw_material_production_id", "!=", False],
+                ["state", "not in", ["done", "cancel"]],
+            ],
+            fields=[
+                "product_id",
+                "raw_material_production_id",
+                "product_uom_qty",
+                "quantity",
+                "state",
+            ],
+        )
+
+        production_ids = sorted({
+            production_id
+            for move in moves
+            if (
+                production_id := many2one_id(
+                    move.get("raw_material_production_id")
+                )
+            ) is not None
+        })
+
+        productions = (
+            self.client.read(
+                "mrp.production",
+                production_ids,
+                ["name", "sale_primary_id", "state"],
+            )
+            if production_ids
+            else []
+        )
+
+        production_by_id = {
+            int(production["id"]): production
+            for production in productions
+        }
+
+        result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for move in moves:
+            reserved_qty = self._qty(move, "quantity")
+            if reserved_qty <= QTY_TOLERANCE:
+                continue
+
+            product_id = many2one_id(move.get("product_id"))
+            production_id = many2one_id(
+                move.get("raw_material_production_id")
+            )
+
+            if product_id is None or production_id is None:
+                continue
+
+            sku = sku_by_product_id.get(product_id)
+            production = production_by_id.get(production_id)
+
+            if not sku or not production:
+                continue
+
+            sale_order_id = many2one_id(
+                production.get("sale_primary_id")
+            )
+
+            if (
+                sale_order_id is None
+                or sale_order_id == current_sale_order_id
+            ):
+                continue
+
+            result[sku].append({
+                "sale_order_id": sale_order_id,
+                "sale_order": many2one_name(
+                    production.get("sale_primary_id")
+                ),
+                "mo_number": str(
+                    production.get("name") or production_id
+                ),
+                "reserved_qty": reserved_qty,
+                "demand_qty": self._qty(
+                    move,
+                    "product_uom_qty",
+                ),
+                "state": str(move.get("state") or ""),
+            })
+
+        return dict(result)
 
     def _supply_chain_by_sku(
         self,
@@ -666,6 +793,60 @@ class FurnixPoValidator:
         )
         result.warnings.extend(supply_warnings)
 
+        cross_so_candidate_skus = set()
+
+        for row in result.rows:
+            sku = normalize_sku_key(row.sku)
+            supply = supply_by_sku.get(sku, {})
+
+            received_qty = float(
+                supply.get("received_qty", 0.0)
+            )
+            sorted_qty = float(
+                supply.get("sorted_qty", 0.0)
+            )
+            sorting_pending_qty = float(
+                supply.get("sorting_pending_qty", 0.0)
+            )
+            input_custom_qty = float(
+                supply.get("input_custom_qty", 0.0)
+            )
+            mo_demand_qty = float(
+                supply.get("mo_demand_qty", 0.0)
+            )
+            mo_reserved_qty = float(
+                supply.get("mo_reserved_qty", 0.0)
+            )
+
+            fully_received = (
+                received_qty + QTY_TOLERANCE
+                >= float(row.po_qty or 0.0)
+            )
+
+            sorting_complete = (
+                sorting_pending_qty <= QTY_TOLERANCE
+                and (
+                    sorted_qty + QTY_TOLERANCE >= received_qty
+                    or input_custom_qty <= QTY_TOLERANCE
+                )
+            )
+
+            mo_missing = (
+                mo_demand_qty > QTY_TOLERANCE
+                and mo_reserved_qty + QTY_TOLERANCE
+                < mo_demand_qty
+            )
+
+            if fully_received and sorting_complete and mo_missing:
+                cross_so_candidate_skus.add(sku)
+
+        cross_so_by_sku = self._cross_so_reservations_by_sku(
+            current_sale_order_id=sale_order_id,
+            skus=cross_so_candidate_skus,
+        )
+
+
+
         for row in result.rows:
             supply = supply_by_sku.get(normalize_sku_key(row.sku), {})
             row.received_qty = float(supply.get("received_qty", 0.0))
@@ -674,6 +855,40 @@ class FurnixPoValidator:
             row.sorting_pending_qty = float(supply.get("sorting_pending_qty", 0.0))
             row.mo_demand_qty = float(supply.get("mo_demand_qty", 0.0))
             row.mo_reserved_qty = float(supply.get("mo_reserved_qty", 0.0))
+            cross_so_reservations = sorted(
+                cross_so_by_sku.get(
+                    normalize_sku_key(row.sku),
+                    [],
+                ),
+                key=lambda item: (
+                    str(item.get("sale_order") or ""),
+                    str(item.get("mo_number") or ""),
+                ),
+            )
+
+            missing_qty = max(
+                row.mo_demand_qty - row.mo_reserved_qty,
+                0.0,
+            )
+
+            relevant_reservations: list[dict[str, Any]] = []
+            relevant_reserved_qty = 0.0
+
+            for item in cross_so_reservations:
+                if relevant_reserved_qty + QTY_TOLERANCE >= missing_qty:
+                    break
+
+                relevant_reservations.append(item)
+                relevant_reserved_qty += float(
+                    item.get("reserved_qty") or 0.0
+                )
+
+            row.cross_so_reservations = relevant_reservations
+            row.cross_so_reserved_qty = min(
+                relevant_reserved_qty,
+                missing_qty,
+            )
+
             row.receipt_names = sorted(set(supply.get("receipt_names", [])))
             row.sorting_names = sorted(set(supply.get("sorting_names", [])))
             row.mo_names = sorted(set(supply.get("mo_names", [])))
