@@ -8,8 +8,13 @@ from core.mo_sorting_audit import (
     MoSortingAuditResult,
     compare_mo_and_sorting_int,
     find_sale_group_field,
+    normalize_group,
 )
-from core.sticker_info_validator import validate_sticker_info
+from core.sticker_info_validator import (
+    StickerInfoParseError,
+    parse_sticker_info,
+    validate_sticker_info,
+)
 
 if TYPE_CHECKING:
     from core.odoo_client import OdooClient
@@ -54,6 +59,10 @@ class FurnixPoComparisonRow:
     sorting_pending_qty: float = 0.0
     mo_demand_qty: float = 0.0
     mo_reserved_qty: float = 0.0
+    mo_group_demand: dict[str, float] = field(default_factory=dict)
+    po_group_qty: dict[str, float] = field(default_factory=dict)
+    mo_po_status: str = "NOT_CHECKED"
+    mo_po_error: str = ""
     cross_so_reserved_qty: float = 0.0
     cross_so_reservations: list[dict[str, Any]] = field(default_factory=list)
     supply_status: str = ""
@@ -129,6 +138,20 @@ class FurnixPoValidationResult:
                 "MO NOT RESERVED",
                 "NO RECEIPT TRACE",
             }
+            for row in self.rows
+        )
+
+    @property
+    def mo_po_status(self) -> str:
+        checked = [row for row in self.rows if row.mo_po_status != "NOT_CHECKED"]
+        if not checked:
+            return "NOT_CHECKED"
+        return "PASS" if all(row.mo_po_status == "MATCH" for row in checked) else "FAIL"
+
+    @property
+    def mo_po_mismatch_count(self) -> int:
+        return sum(
+            row.mo_po_status not in {"MATCH", "NOT_CHECKED"}
             for row in self.rows
         )
 
@@ -398,13 +421,16 @@ class FurnixPoValidator:
                 "received_qty": 0.0, "input_custom_qty": 0.0,
                 "sorted_qty": 0.0, "sorting_pending_qty": 0.0,
                 "mo_demand_qty": 0.0, "mo_reserved_qty": 0.0,
+                "mo_group_demand": defaultdict(float),
                 "receipt_names": [], "sorting_names": [], "mo_names": [],
             }
         )
 
         picking_fields = self._fields("stock.picking")
         move_fields = self._fields("stock.move")
-        production_fields = self._fields("mrp.production")
+        production_metadata = self._field_metadata("mrp.production")
+        production_fields = set(production_metadata)
+        production_group_field = find_sale_group_field(production_metadata)
 
         po_id = int(purchase_order["id"])
         po_picking_ids = [int(value) for value in purchase_order.get("picking_ids", [])]
@@ -478,9 +504,18 @@ class FurnixPoValidator:
             warnings.append("mrp.production neturi lauko sale_primary_id; MO rezervacijos pagal SO patikra negalima.")
             return supply, warnings
 
+        production_query_fields = ["name", "move_raw_ids", "state"]
+        if production_group_field:
+            production_query_fields.append(production_group_field)
+        else:
+            warnings.append(
+                "mrp.production Sale Group Name laukas neaptiktas; "
+                "MO ↔ PO kiekių pagal grupę patikra negalima."
+            )
+
         productions = self.client.search_read(
             "mrp.production", [[primary_field, "=", sale_order_id], ["state", "!=", "cancel"]],
-            fields=["name", "move_raw_ids", "state"], order="id asc",
+            fields=production_query_fields, order="id asc",
         )
         raw_move_ids = [int(move_id) for production in productions for move_id in production.get("move_raw_ids", [])]
         raw_moves = self.client.read("stock.move", raw_move_ids, move_query_fields) if raw_move_ids else []
@@ -489,14 +524,30 @@ class FurnixPoValidator:
         if missing_product_ids:
             products = self.client.read("product.product", missing_product_ids, ["default_code"])
             sku_by_product.update({int(product["id"]): normalize_sku_key(product.get("default_code")) for product in products})
-        production_by_raw_move = {int(move_id): str(production.get("name") or production["id"]) for production in productions for move_id in production.get("move_raw_ids", [])}
+        production_by_raw_move = {
+            int(move_id): production
+            for production in productions
+            for move_id in production.get("move_raw_ids", [])
+        }
         for move in raw_moves:
             sku = sku_by_product.get(many2one_id(move.get("product_id")) or -1, "")
             if not sku or move.get("state") == "cancel":
                 continue
             supply[sku]["mo_demand_qty"] += self._qty(move, "product_uom_qty")
             supply[sku]["mo_reserved_qty"] += self._qty(move, "quantity", "quantity_done")
-            supply[sku]["mo_names"].append(production_by_raw_move.get(int(move["id"]), "?"))
+            production = production_by_raw_move.get(int(move["id"]), {})
+            supply[sku]["mo_names"].append(
+                str(production.get("name") or production.get("id") or "?")
+            )
+            group_name = normalize_group(
+                production.get(production_group_field)
+                if production_group_field
+                else ""
+            )
+            if group_name:
+                supply[sku]["mo_group_demand"][group_name] += self._qty(
+                    move, "product_uom_qty"
+                )
 
         return supply, warnings
 
@@ -967,6 +1018,39 @@ class FurnixPoValidator:
             row.sorting_pending_qty = float(supply.get("sorting_pending_qty", 0.0))
             row.mo_demand_qty = float(supply.get("mo_demand_qty", 0.0))
             row.mo_reserved_qty = float(supply.get("mo_reserved_qty", 0.0))
+            row.mo_group_demand = dict(supply.get("mo_group_demand", {}))
+            try:
+                po_group_qty: dict[str, float] = defaultdict(float)
+                for sticker_value in row.component_sticker_info:
+                    for assignment in parse_sticker_info(sticker_value):
+                        po_group_qty[normalize_group(assignment.group_name)] += assignment.qty
+                row.po_group_qty = dict(po_group_qty)
+            except StickerInfoParseError as exc:
+                row.mo_po_status = "STICKER_INFO_ERROR"
+                row.mo_po_error = str(exc)
+            else:
+                if row.mo_group_demand:
+                    group_names = sorted(set(row.mo_group_demand) | set(row.po_group_qty))
+                    mismatches = [
+                        (
+                            group_name,
+                            row.mo_group_demand.get(group_name, 0.0),
+                            row.po_group_qty.get(group_name, 0.0),
+                        )
+                        for group_name in group_names
+                        if abs(
+                            row.mo_group_demand.get(group_name, 0.0)
+                            - row.po_group_qty.get(group_name, 0.0)
+                        ) > QTY_TOLERANCE
+                    ]
+                    if mismatches:
+                        row.mo_po_status = "QTY_MISMATCH"
+                        row.mo_po_error = "; ".join(
+                            f"{group}: MO={mo_qty:g}, PO={po_qty:g}"
+                            for group, mo_qty, po_qty in mismatches
+                        )
+                    else:
+                        row.mo_po_status = "MATCH"
             cross_so_reservations = sorted(
                 cross_so_by_sku.get(
                     normalize_sku_key(row.sku),

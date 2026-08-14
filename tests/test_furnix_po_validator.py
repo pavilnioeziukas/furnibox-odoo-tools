@@ -7,7 +7,11 @@ from tests.helpers import (
     FakeOdooClient,
     explosion_row,
 )
-from validators.furnix_po_validator import FurnixPoValidator
+from validators.furnix_po_validator import (
+    FurnixPoComparisonRow,
+    FurnixPoValidationResult,
+    FurnixPoValidator,
+)
 
 
 DETAIL_SKU = "EU-SIDE-SREW-720x560-WW"
@@ -64,6 +68,26 @@ def validate(po_specs, *, required_qty=1, bom_errors=None, po_count=1):
 
 
 class FurnixPoValidatorTests(unittest.TestCase):
+    def test_mo_po_summary_is_independent_from_catalog_status(self):
+        result = FurnixPoValidationResult(
+            so_number="SO001",
+            status="QTY MISMATCH",
+            rows=[
+                FurnixPoComparisonRow(
+                    sku=DETAIL_SKU,
+                    product_name="",
+                    required_qty=3,
+                    po_qty=2,
+                    difference=-1,
+                    status="QTY MISMATCH",
+                    mo_demand_qty=2,
+                    mo_po_status="MATCH",
+                )
+            ],
+        )
+        self.assertEqual(result.mo_po_status, "PASS")
+        self.assertEqual(result.mo_po_mismatch_count, 0)
+
     def test_pass(self):
         self.assertEqual(validate([{}]).status, "PASS")
 
