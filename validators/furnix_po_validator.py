@@ -1089,9 +1089,9 @@ class FurnixPoValidator:
             row.sorting_names = sorted(set(supply.get("sorting_names", [])))
             row.mo_names = sorted(set(supply.get("mo_names", [])))
 
-            # PO comparison errors remain the primary status.  Supply status
-            # explains why a correctly ordered component is still unavailable.
-            if row.status != "PASS":
+            # Supply readiness follows the concrete MO demand.  Catalog-vs-PO
+            # differences remain a separate master-data diagnostic.
+            if row.mo_po_status not in {"MATCH", "NOT_CHECKED"}:
                 row.supply_status = "NOT CHECKED"
             elif row.received_qty + QTY_TOLERANCE < row.po_qty:
                 row.supply_status = "NOT RECEIVED"
