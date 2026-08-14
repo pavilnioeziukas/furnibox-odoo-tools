@@ -10,6 +10,7 @@ from core.odoo_client import (
 from validators.furnix_po_validator import (
     FurnixPoValidator,
 )
+from core.mo_sorting_audit import duplicate_sides
 
 
 # Paleidžiant kitam užsakymui keičiamas tik šis numeris.
@@ -141,6 +142,24 @@ def main() -> None:
             f"{result.supply_issue_count}"
         )
 
+        mo_sorting = result.mo_sorting_audit
+        duplicate_mo, duplicate_int = duplicate_sides(mo_sorting.rows)
+        print()
+        print("MO ↔ SORTING INT AUDIT")
+        print(
+            f"Status: {mo_sorting.status} | MO: {mo_sorting.mo_count} | "
+            f"INT: {mo_sorting.int_count} | matched: {mo_sorting.matched_count} | "
+            f"missing INT: {mo_sorting.missing_int_count} | "
+            f"extra INT: {mo_sorting.missing_mo_count} | "
+            f"duplicate MO/INT: {duplicate_mo}/{duplicate_int}"
+        )
+        for audit_row in mo_sorting.rows:
+            print(
+                f"- {audit_row.status:<16} group={audit_row.group_name or '<EMPTY>'} "
+                f"MO={', '.join(audit_row.mo_names) or '-'} "
+                f"INT={', '.join(audit_row.int_names) or '-'}"
+            )
+
         print()
         print("=" * 220)
 
@@ -190,7 +209,7 @@ def main() -> None:
                     f" | MO: {', '.join(row.mo_names) or '-'}"
                 )
 
-               print()
+            print()
         print("=" * 100)
 
         if result.supply_issue_count == 0:

@@ -3,6 +3,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 from core.furnix_part_classifier import FurnixPartClassifier
 from core.odoo_helpers import many2one_id, many2one_name
+from core.mo_sorting_audit import (
+    GroupedDocument,
+    MoSortingAuditResult,
+    compare_mo_and_sorting_int,
+    find_sale_group_field,
+)
 from core.sticker_info_validator import validate_sticker_info
 
 if TYPE_CHECKING:
@@ -74,6 +80,9 @@ class FurnixPoValidationResult:
     warnings: list[str] = field(default_factory=list)
 
     rows: list[FurnixPoComparisonRow] = field(default_factory=list)
+    mo_sorting_audit: MoSortingAuditResult = field(
+        default_factory=MoSortingAuditResult
+    )
 
     @property
     def missing_count(self) -> int:
@@ -140,6 +149,104 @@ class FurnixPoValidator:
         just because a standard field was renamed or is unavailable.
         """
         return set(self.client.execute(model, "fields_get").keys())
+
+    def _field_metadata(self, model: str) -> dict[str, dict[str, Any]]:
+        return self.client.execute(
+            model,
+            "fields_get",
+            kwargs={"attributes": ["string", "type"]},
+        )
+
+    def _audit_mo_sorting_int(
+        self,
+        *,
+        sale_order_id: int,
+    ) -> MoSortingAuditResult:
+        """Audit MO and Sorting INT links using only discovered Odoo fields."""
+        production_fields = self._field_metadata("mrp.production")
+        picking_fields = self._field_metadata("stock.picking")
+        warnings: list[str] = []
+
+        for model, fields in (
+            ("mrp.production", production_fields),
+            ("stock.picking", picking_fields),
+        ):
+            if "sale_primary_id" not in fields:
+                warnings.append(
+                    f"{model} neturi sale_primary_id; MO ↔ Sorting INT auditas negalimas."
+                )
+
+        mo_group_field = find_sale_group_field(production_fields)
+        int_group_field = find_sale_group_field(picking_fields)
+        if not mo_group_field:
+            warnings.append(
+                "mrp.production Sale Group Name laukas neaptiktas pagal Odoo metaduomenis."
+            )
+        if not int_group_field:
+            warnings.append(
+                "stock.picking Sale Group Name laukas neaptiktas pagal Odoo metaduomenis."
+            )
+
+        if warnings:
+            return MoSortingAuditResult(
+                checked=False,
+                warnings=warnings,
+            )
+
+        productions = self.client.search_read(
+            model="mrp.production",
+            domain=[
+                ["sale_primary_id", "=", sale_order_id],
+                ["state", "!=", "cancel"],
+            ],
+            fields=["name", mo_group_field],
+            order="id asc",
+        )
+        pickings = self.client.search_read(
+            model="stock.picking",
+            domain=[
+                ["sale_primary_id", "=", sale_order_id],
+                ["state", "!=", "cancel"],
+            ],
+            fields=[
+                name
+                for name in ["name", "picking_type_id", int_group_field]
+                if name in picking_fields
+            ],
+            order="id asc",
+        )
+
+        sorting_pickings = [
+            picking
+            for picking in pickings
+            if str(picking.get("name") or "").strip().upper().startswith("INT")
+            or "SORTING" in many2one_name(picking.get("picking_type_id")).upper()
+            or "RŪŠIAV" in many2one_name(picking.get("picking_type_id")).upper()
+        ]
+
+        result = compare_mo_and_sorting_int(
+            [
+                GroupedDocument(
+                    int(record["id"]),
+                    str(record.get("name") or record["id"]),
+                    str(record.get(mo_group_field) or ""),
+                )
+                for record in productions
+            ],
+            [
+                GroupedDocument(
+                    int(record["id"]),
+                    str(record.get("name") or record["id"]),
+                    str(record.get(int_group_field) or ""),
+                )
+                for record in sorting_pickings
+            ],
+        )
+        result.warnings.append(
+            "SKU ir quantity nelyginami: MO galutinio produkto ir Sorting INT judėjimų "
+            "produktų/kiekių vienoda semantika Odoo metaduomenyse nepatvirtinta."
+        )
+        return result
 
     @staticmethod
     def _qty(record: dict[str, Any], *field_names: str) -> float:
@@ -427,6 +534,11 @@ class FurnixPoValidator:
         sale_order_id = int(
             sale_orders[0]["id"]
         )
+
+        result.mo_sorting_audit = self._audit_mo_sorting_int(
+            sale_order_id=sale_order_id,
+        )
+        result.warnings.extend(result.mo_sorting_audit.warnings)
 
         purchase_orders = self.client.search_read(
             model="purchase.order",

@@ -7,10 +7,20 @@ from core.models import BomError, ExplosionRow
 
 
 class FakeOdooClient:
-    def __init__(self, records: dict[str, list[dict[str, Any]]]) -> None:
+    def __init__(
+        self,
+        records: dict[str, list[dict[str, Any]]],
+        field_metadata: dict[str, dict[str, dict[str, Any]]] | None = None,
+    ) -> None:
         self.records = records
+        self.field_metadata = field_metadata or {}
 
-    def search_read(self, *, model: str, domain: list, fields: list, **kwargs):
+    def execute(self, model: str, method: str, **kwargs):
+        if method != "fields_get":
+            raise AssertionError(f"Unexpected fake method: {method}")
+        return self.field_metadata.get(model, {})
+
+    def search_read(self, model: str, domain: list, fields: list, **kwargs):
         rows = list(self.records.get(model, []))
         for field_name, operator, expected in domain:
             if operator == "=":
@@ -20,7 +30,7 @@ class FakeOdooClient:
         limit = kwargs.get("limit")
         return rows[:limit] if limit else rows
 
-    def read(self, *, model: str, record_ids: list[int], fields: list):
+    def read(self, model: str, record_ids: list[int], fields: list):
         wanted = set(record_ids)
         return [
             row for row in self.records.get(model, [])
