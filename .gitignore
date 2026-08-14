@@ -16,3 +16,6 @@ logs/
 
 # VS Code
 .vscode/
+
+# Python packaging
+*.egg-info/
