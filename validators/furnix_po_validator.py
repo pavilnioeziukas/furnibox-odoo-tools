@@ -188,6 +188,7 @@ class FurnixPoValidator:
         """Audit MO and Sorting INT links using only discovered Odoo fields."""
         production_fields = self._field_metadata("mrp.production")
         picking_fields = self._field_metadata("stock.picking")
+        move_fields = self._field_metadata("stock.move")
         warnings: list[str] = []
 
         for model, fields in (
@@ -233,7 +234,10 @@ class FurnixPoValidator:
             ],
             fields=[
                 name
-                for name in ["name", "picking_type_id", int_group_field]
+                for name in [
+                    "name", "picking_type_id", "move_ids_without_package",
+                    int_group_field,
+                ]
                 if name in picking_fields
             ],
             order="id asc",
@@ -246,6 +250,46 @@ class FurnixPoValidator:
             or "SORTING" in many2one_name(picking.get("picking_type_id")).upper()
             or "RŪŠIAV" in many2one_name(picking.get("picking_type_id")).upper()
         ]
+
+        kit_field = None
+        for field_name in ("description_bom_line",):
+            if field_name in move_fields:
+                kit_field = field_name
+                break
+        if kit_field is None:
+            candidates = [
+                field_name
+                for field_name, metadata in move_fields.items()
+                if str(metadata.get("string") or "").strip().casefold() == "kit"
+                and metadata.get("type") == "char"
+            ]
+            if len(candidates) == 1:
+                kit_field = candidates[0]
+
+        kit_picking_ids: set[int] = set()
+        if kit_field:
+            move_ids = [
+                int(move_id)
+                for picking in sorting_pickings
+                for move_id in picking.get("move_ids_without_package", [])
+            ]
+            kit_move_fields = [kit_field]
+            if "picking_id" in move_fields:
+                kit_move_fields.append("picking_id")
+            if "bom_line_id" in move_fields:
+                kit_move_fields.append("bom_line_id")
+            kit_moves = self.client.read(
+                model="stock.move",
+                record_ids=move_ids,
+                fields=kit_move_fields,
+            ) if move_ids else []
+            kit_picking_ids = {
+                picking_id
+                for move in kit_moves
+                if move.get(kit_field)
+                and ("bom_line_id" not in move_fields or move.get("bom_line_id"))
+                and (picking_id := many2one_id(move.get("picking_id"))) is not None
+            }
 
         result = compare_mo_and_sorting_int(
             [
@@ -261,6 +305,7 @@ class FurnixPoValidator:
                     int(record["id"]),
                     str(record.get("name") or record["id"]),
                     str(record.get(int_group_field) or ""),
+                    int(record["id"]) in kit_picking_ids,
                 )
                 for record in sorting_pickings
             ],

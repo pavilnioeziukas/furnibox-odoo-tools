@@ -14,6 +14,7 @@ class GroupedDocument:
     document_id: int
     name: str
     group_name: str
+    is_kit: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,10 +56,26 @@ class MoSortingAuditResult:
         return sum(row.status == "DUPLICATE_GROUP" for row in self.rows)
 
     @property
+    def kit_int_count(self) -> int:
+        return sum(
+            len(row.int_names) for row in self.rows
+            if row.status == "KIT_NO_MO"
+        )
+
+    @property
+    def missing_group_count(self) -> int:
+        return sum(
+            len(row.mo_names) + len(row.int_names)
+            for row in self.rows
+            if row.status == "MISSING_GROUP"
+        )
+
+    @property
     def status(self) -> str:
         if not self.checked:
             return "NOT_CHECKED"
-        return "PASS" if all(row.status == "MATCH" for row in self.rows) else "FAIL"
+        acceptable = {"MATCH", "KIT_NO_MO"}
+        return "PASS" if all(row.status in acceptable for row in self.rows) else "FAIL"
 
 
 def compare_mo_and_sorting_int(
@@ -68,17 +85,26 @@ def compare_mo_and_sorting_int(
     """Compare records by Primary SO (query scope) and Sale Group Name."""
     mos: dict[str, list[str]] = defaultdict(list)
     ints: dict[str, list[str]] = defaultdict(list)
+    kit_int_names: set[str] = set()
 
     for document in manufacturing_orders:
         mos[normalize_group(document.group_name)].append(document.name)
     for document in sorting_ints:
         ints[normalize_group(document.group_name)].append(document.name)
+        if document.is_kit:
+            kit_int_names.add(document.name)
 
     rows: list[MoSortingAuditRow] = []
     for group_name in sorted(set(mos) | set(ints)):
         mo_names = tuple(sorted(mos.get(group_name, [])))
         int_names = tuple(sorted(ints.get(group_name, [])))
-        if not group_name:
+        if (
+            not mo_names
+            and int_names
+            and all(name in kit_int_names for name in int_names)
+        ):
+            status = "KIT_NO_MO"
+        elif not group_name:
             status = "MISSING_GROUP"
         elif len(mo_names) > 1 or len(int_names) > 1:
             status = "DUPLICATE_GROUP"

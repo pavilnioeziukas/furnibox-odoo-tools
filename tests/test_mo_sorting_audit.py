@@ -10,8 +10,8 @@ from tests.helpers import FakeExecutionEngine, FakeExplosionResult, FakeOdooClie
 from validators.furnix_po_validator import FurnixPoValidator
 
 
-def doc(document_id, name, group):
-    return GroupedDocument(document_id, name, group)
+def doc(document_id, name, group, *, is_kit=False):
+    return GroupedDocument(document_id, name, group, is_kit)
 
 
 class MoSortingComparisonTests(unittest.TestCase):
@@ -46,6 +46,15 @@ class MoSortingComparisonTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.rows[0].status, "MISSING_GROUP")
+
+    def test_kit_int_without_mo_is_valid(self):
+        result = compare_mo_and_sorting_int(
+            [], [doc(2, "WH/INT/18861", "", is_kit=True)]
+        )
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.rows[0].status, "KIT_NO_MO")
+        self.assertEqual(result.kit_int_count, 1)
+        self.assertEqual(result.missing_group_count, 0)
 
     def test_field_is_resolved_from_exact_odoo_label(self):
         self.assertEqual(
